@@ -4,14 +4,25 @@ namespace hal {
 
 TeensyCan* TeensyCan::active_instance_ = nullptr;
 
-bool TeensyCan::begin() {
+void TeensyCan::begin() {
     active_instance_ = this;
     can_.begin();
     can_.setBaudRate(CAN_BITRATE_BPS);
-    can_.onReceive(receiveCallback);
     can_.enableFIFO();
+    can_.setFIFOFilter(REJECT_ALL);
+    if (filter_count_ == 0) {
+        can_.setFIFOUserFilter(0, 0, 0, EXT);
+    } else {
+        for (size_t index = 0; index < filter_count_; ++index) {
+            can_.setFIFOUserFilter(static_cast<uint8_t>(index),
+                                   filters_[index].id,
+                                   filters_[index].mask,
+                                   EXT);
+        }
+    }
+    can_.onReceive(receiveCallback);
     can_.enableFIFOInterrupt();
-    return true;
+    started_ = true;
 }
 
 bool TeensyCan::send(const CanFrame& frame) {
@@ -19,20 +30,28 @@ bool TeensyCan::send(const CanFrame& frame) {
     CAN_message_t message = {};
     message.id = frame.id;
     message.len = frame.length;
-    message.flags.extended = frame.format == CanIdFormat::Extended;
+    message.flags.extended = 1;
     for (uint8_t index = 0; index < frame.length; ++index) message.buf[index] = frame.data[index];
     return can_.write(message);
 }
 
-bool TeensyCan::receive(CanFrame& frame) { return pop(frame); }
+bool TeensyCan::receive(CanFrame& frame) {
+    noInterrupts();
+    const bool ok = rx_buffer_.pop(frame);
+    interrupts();
+    return ok;
+}
 
 bool TeensyCan::addFilter(const CanFilter& filter) {
-    if (filter_count_ >= CAN_MAX_FILTERS) return false;
+    if (started_ || filter_count_ >= CAN_MAX_FILTERS) return false;
     filters_[filter_count_++] = filter;
     return true;
 }
 
-void TeensyCan::clearFilters() { filter_count_ = 0; }
+void TeensyCan::clearFilters() {
+    if (started_) return;
+    filter_count_ = 0;
+}
 
 CanBusState TeensyCan::busState() const {
     // FlexCAN ESR1 FLTCONF: 0 = active, 1 = passive, 2 = bus-off.
@@ -42,45 +61,21 @@ CanBusState TeensyCan::busState() const {
     return CanBusState::ErrorActive;
 }
 
+void TeensyCan::clearRxOverflow() {
+    noInterrupts();
+    rx_buffer_.clearOverflow();
+    interrupts();
+}
+
 void TeensyCan::receiveCallback(const CAN_message_t& message) {
     if (active_instance_ == nullptr) return;
+    if (!message.flags.extended || message.len > CAN_MAX_DATA_LENGTH) return;
     CanFrame frame;
     frame.id = message.id;
-    frame.format = message.flags.extended ? CanIdFormat::Extended : CanIdFormat::Standard;
-    frame.length = message.len > CAN_MAX_DATA_LENGTH ? CAN_MAX_DATA_LENGTH : message.len;
+    frame.length = message.len;
     frame.received_at_us = micros();
     for (uint8_t index = 0; index < frame.length; ++index) frame.data[index] = message.buf[index];
-    active_instance_->push(frame);
-}
-
-bool TeensyCan::accepted(const CanFrame& frame) {
-    if (active_instance_->filter_count_ == 0) return true;
-    for (size_t index = 0; index < active_instance_->filter_count_; ++index) {
-        const CanFilter& filter = active_instance_->filters_[index];
-        if (filter.id == frame.id && filter.format == frame.format) return true;
-    }
-    return false;
-}
-
-bool TeensyCan::push(const CanFrame& frame) {
-    if (!accepted(frame)) return false;
-    const size_t next = (write_index_ + 1) % CAN_RX_QUEUE_CAPACITY;
-    if (next == read_index_) { rx_overflowed_ = true; return false; }
-    queue_[write_index_] = frame;
-    write_index_ = next;
-    return true;
-}
-
-bool TeensyCan::pop(CanFrame& frame) {
-    noInterrupts();
-    if (read_index_ == write_index_) {
-        interrupts();
-        return false;
-    }
-    frame = queue_[read_index_];
-    read_index_ = (read_index_ + 1) % CAN_RX_QUEUE_CAPACITY;
-    interrupts();
-    return true;
+    active_instance_->rx_buffer_.push(frame);
 }
 
 }  // namespace hal
