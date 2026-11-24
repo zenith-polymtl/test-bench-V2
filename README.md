@@ -1,4 +1,4 @@
-# zenith-bench-test
+# zenith-test-bench
 
 Firmware pour le banc de test moteur — Équipe Contrôle, Zenith.
 
